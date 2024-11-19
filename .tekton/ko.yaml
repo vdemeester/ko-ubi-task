@@ -111,7 +111,7 @@ spec:
         - $(params.SOURCE_ARTIFACT)=/var/workdir/source
         - $(params.CACHI2_ARTIFACT)=/var/workdir/cachi2
     - name: build
-      image: ghcr.io/vdemeester/ko-ubi-task
+      image: ghcr.io/vdemeester/ko-ubi-task/ko
       args:
         - --labels
         - $(params.LABELS[*])
@@ -121,6 +121,8 @@ spec:
           name: trusted-ca
           readOnly: true
       env:
+        - name: PACKAGE
+          value: $(params.PACKAGE)
         - name: COMMIT_SHA
           value: $(params.COMMIT_SHA)
       script: |
@@ -151,6 +153,10 @@ spec:
           esac
         done
 
+        UNSHARE_ARGS=()
+        if [ "${HERMETIC}" == "true" ]; then
+          UNSHARE_ARGS+=("--net")
+        fi
 
         DEFAULT_LABELS=(
           "--image-label" "build-date=$(date -u +'%Y-%m-%dT%H:%M:%S')"
@@ -164,12 +170,14 @@ spec:
 
         # Prevent ShellCheck from giving a warning because 'image' is defined and 'IMAGE' is not.
         declare IMAGE
+        TAG=$(echo $IMAGE | cut -d: -f2)
 
         ko_cmd_array=(
           ko publish
           "${LABELS[@]}"
+          --base-import-paths
           --insecure-registry="$TLSVERIFY"
-          -t "$IMAGE" $PACKAGE
+          -t "$TAG" $PACKAGE
         )
         ko_cmd=$(printf "%q " "${ko_cmd_array[@]}")
 
@@ -177,7 +185,7 @@ spec:
           # enabling loopback adapter enables Bazel builds to work in hermetic mode.
           command="ip link set lo up && ko_cmd"
         else
-          command="ko_cmd"
+          command="$ko_cmd"
         fi
 
         # Save the SBOM produced by Cachi2 so it can be merged into the final SBOM later
@@ -185,13 +193,10 @@ spec:
           cp /tmp/cachi2/output/bom.json ./sbom-cachi2.json
         fi
 
-        touch /shared/base_images_digests
-        for image in $BASE_IMAGES; do
-          buildah images --format '{{ .Name }}:{{ .Tag }}@{{ .Digest }}' --filter reference="$image" >>/shared/base_images_digests
-        done
+        export KO_DOCKER_REPO=$(echo $IMAGE | cut -d: -f1 | cut -d/ -f-3)
 
-        # Needed to generate base images SBOM
-        echo "$BASE_IMAGES" >/shared/base_images_from_dockerfile
+        unshare -Uf "${UNSHARE_ARGS[@]}" --keep-caps -r --map-users 1,1,65536 --map-groups 1,1,65536 -w "${SOURCE_CODE_DIR}" -- sh -c "$command"
+
       computeResources:
         limits:
           cpu: "4"
