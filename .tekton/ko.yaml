@@ -1,0 +1,205 @@
+---
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: ko-ta
+  annotations:
+    tekton.dev/pipelines.minVersion: 0.56.0
+    tekton.dev/tags: image-build, konflux
+  labels:
+    app.kubernetes.io/version: "0.1"
+    build.appstudio.redhat.com/build_type: docker
+spec:
+  description: |-
+    ko task builds source code into a container image and pushes the image into container registry using ko tool.
+    In addition it generates a SBOM file, injects the SBOM file into final container image and pushes the SBOM file as separate image using cosign tool.
+    When prefetch-dependencies task was activated it is using its artifacts to run build in hermetic environment.
+  params:
+    - name: PACKAGE
+      description: Package to be build (something containing `main`)
+      type: string
+    - name: COMMIT_SHA
+      description: The image is built from this commit.
+      type: string
+      default: ""
+    - name: HERMETIC
+      description: Determines if build will be executed without network access.
+      type: string
+      default: "false"
+    - name: IMAGE
+      description: Reference of the image buildah will produce.
+      type: string
+    - name: IMAGE_EXPIRES_AFTER
+      description: Delete image tag after specified time. Empty means to keep
+        the image tag. Time values could be something like 1h, 2d, 3w for
+        hours, days, and weeks, respectively.
+      type: string
+      default: ""
+    - name: LABELS
+      description: Additional key=value labels that should be applied to the
+        image
+      type: array
+      default: []
+    - name: PREFETCH_INPUT
+      description: In case it is not empty, the prefetched content should
+        be made available to the build.
+      type: string
+      default: ""
+    - name: SOURCE_ARTIFACT
+      description: The Trusted Artifact URI pointing to the artifact with
+        the application source code.
+      type: string
+    - name: TLSVERIFY
+      description: Verify the TLS on the registry endpoint (for push/pull
+        to a non-TLS registry)
+      type: string
+      default: "true"
+    - name: caTrustConfigMapKey
+      description: The name of the key in the ConfigMap that contains the
+        CA bundle data.
+      type: string
+      default: ca-bundle.crt
+    - name: caTrustConfigMapName
+      description: The name of the ConfigMap to read CA bundle data from.
+      type: string
+      default: trusted-ca
+  results:
+    - name: IMAGE_DIGEST
+      description: Digest of the image just built
+    - name: IMAGE_REF
+      description: Image reference of the built image
+    - name: IMAGE_URL
+      description: Image repository and tag where the built image was pushed
+    - name: SBOM_BLOB_URL
+      description: Reference of SBOM blob digest to enable digest-based verification
+        from provenance
+      type: string
+  volumes:
+    - name: shared
+      emptyDir: {}
+    - name: trusted-ca
+      configMap:
+        items:
+          - key: $(params.caTrustConfigMapKey)
+            path: ca-bundle.crt
+        name: $(params.caTrustConfigMapName)
+        optional: true
+    - name: workdir
+      emptyDir: {}
+  stepTemplate:
+    env:
+      - name: HERMETIC
+        value: $(params.HERMETIC)
+      - name: IMAGE
+        value: $(params.IMAGE)
+      - name: IMAGE_EXPIRES_AFTER
+        value: $(params.IMAGE_EXPIRES_AFTER)
+      - name: SOURCE_CODE_DIR
+        value: source
+      - name: TLSVERIFY
+        value: $(params.TLSVERIFY)
+    volumeMounts:
+      - mountPath: /shared
+        name: shared
+      - mountPath: /var/workdir
+        name: workdir
+  steps:
+    - name: use-trusted-artifact
+      image: quay.io/redhat-appstudio/build-trusted-artifacts:latest@sha256:81c4864dae6bb11595f657be887e205262e70086a05ed16ada827fd6391926ac
+      args:
+        - use
+        - $(params.SOURCE_ARTIFACT)=/var/workdir/source
+        - $(params.CACHI2_ARTIFACT)=/var/workdir/cachi2
+    - name: build
+      image: ghcr.io/vdemeester/ko-ubi-task
+      args:
+        - --labels
+        - $(params.LABELS[*])
+      workingDir: /var/workdir
+      volumeMounts:
+        - mountPath: /mnt/trusted-ca
+          name: trusted-ca
+          readOnly: true
+      env:
+        - name: COMMIT_SHA
+          value: $(params.COMMIT_SHA)
+      script: |
+        #!/bin/bash
+        set -euo pipefail
+        ca_bundle=/mnt/trusted-ca/ca-bundle.crt
+        if [ -f "$ca_bundle" ]; then
+          echo "INFO: Using mounted CA bundle: $ca_bundle"
+          cp -vf $ca_bundle /etc/pki/ca-trust/source/anchors
+          update-ca-trust
+        fi
+
+        LABELS=()
+        # Split `args` into two sets of arguments.
+        while [[ $# -gt 0 ]]; do
+          case $1 in
+          --labels)
+            shift
+            while [[ $# -gt 0 && $1 != --* ]]; do
+              LABELS+=("--image-label" "$1")
+              shift
+            done
+            ;;
+          *)
+            echo "unexpected argument: $1" >&2
+            exit 2
+            ;;
+          esac
+        done
+
+
+        DEFAULT_LABELS=(
+          "--image-label" "build-date=$(date -u +'%Y-%m-%dT%H:%M:%S')"
+          "--image-label" "vcs-type=git"
+        )
+        [ -n "$COMMIT_SHA" ] && DEFAULT_LABELS+=("--image-label" "vcs-ref=$COMMIT_SHA")
+        [ -n "$IMAGE_EXPIRES_AFTER" ] && DEFAULT_LABELS+=("--image-label" "quay.expires-after=$IMAGE_EXPIRES_AFTER")
+
+        # Concatenate defaults and explicit labels. If a label appears twice, the last one wins.
+        LABELS=("${DEFAULT_LABELS[@]}" "${LABELS[@]}")
+
+        # Prevent ShellCheck from giving a warning because 'image' is defined and 'IMAGE' is not.
+        declare IMAGE
+
+        ko_cmd_array=(
+          ko publish
+          "${LABELS[@]}"
+          --insecure-registry="$TLSVERIFY"
+          -t "$IMAGE" $PACKAGE
+        )
+        ko_cmd=$(printf "%q " "${ko_cmd_array[@]}")
+
+        if [ "${HERMETIC}" == "true" ]; then
+          # enabling loopback adapter enables Bazel builds to work in hermetic mode.
+          command="ip link set lo up && ko_cmd"
+        else
+          command="ko_cmd"
+        fi
+
+        # Save the SBOM produced by Cachi2 so it can be merged into the final SBOM later
+        if [ -f "/tmp/cachi2/output/bom.json" ]; then
+          cp /tmp/cachi2/output/bom.json ./sbom-cachi2.json
+        fi
+
+        touch /shared/base_images_digests
+        for image in $BASE_IMAGES; do
+          buildah images --format '{{ .Name }}:{{ .Tag }}@{{ .Digest }}' --filter reference="$image" >>/shared/base_images_digests
+        done
+
+        # Needed to generate base images SBOM
+        echo "$BASE_IMAGES" >/shared/base_images_from_dockerfile
+      computeResources:
+        limits:
+          cpu: "4"
+          memory: 8Gi
+        requests:
+          cpu: "1"
+          memory: 2Gi
+      securityContext:
+        capabilities:
+          add:
+            - SETFCAP
